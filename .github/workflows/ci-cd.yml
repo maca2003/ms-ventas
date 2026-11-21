@@ -17,9 +17,9 @@ jobs:
     name: Build y test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "21"
@@ -62,7 +62,7 @@ jobs:
     outputs:
       imagen: ${{ steps.publicar.outputs.imagen }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Credenciales AWS (Learner Lab)
         uses: aws-actions/configure-aws-credentials@v4
