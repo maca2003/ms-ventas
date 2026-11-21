@@ -92,17 +92,32 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SSH_OPTS: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i llave.pem
+      EC2_HOST: ${{ secrets.EC2_HOST }}
     steps:
+      # Antes de crear el clúster (pipeline de infraestructura-swarm) no existe EC2_HOST:
+      # la imagen queda publicada en ECR y el despliegue se omite.
+      - name: Verificar si el clúster está configurado
+        id: cluster
+        run: |
+          if [ -n "$EC2_HOST" ]; then
+            echo "listo=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "listo=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Secret EC2_HOST no configurado: se omite el despliegue"
+          fi
+
       - name: Preparar llave SSH
+        if: steps.cluster.outputs.listo == 'true'
         run: |
           echo "${{ secrets.EC2_SSH_KEY }}" > llave.pem
           chmod 600 llave.pem
 
       - name: docker service update
+        if: steps.cluster.outputs.listo == 'true'
         run: |
           IMAGEN="${{ needs.imagen.outputs.imagen }}"
           REGISTRY="${IMAGEN%%/*}"
-          ssh $SSH_OPTS "ec2-user@${{ secrets.EC2_HOST }}" bash -s <<EOF
+          ssh $SSH_OPTS "ec2-user@${EC2_HOST}" bash -s <<EOF
           set -e
           aws ecr get-login-password --region $AWS_REGION | sudo docker login --username AWS --password-stdin $REGISTRY
           if sudo docker service inspect sistema_$SERVICIO >/dev/null 2>&1; then
@@ -114,8 +129,9 @@ jobs:
           EOF
 
       - name: Verificar que el servicio responde en la nube
+        if: steps.cluster.outputs.listo == 'true'
         run: |
-          URL="http://${{ secrets.EC2_HOST }}:8080"
+          URL="http://${EC2_HOST}:8080"
           for i in $(seq 1 20); do
             TOKEN=$(curl -s -X POST "$URL/api/auth/login" -H "Content-Type: application/json" \
               -d '{"username":"admin","password":"admin123"}' | jq -r '.token // empty' 2>/dev/null || true)
