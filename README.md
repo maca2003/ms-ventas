@@ -56,6 +56,39 @@ src/main/java/cl/duoc/msventas
 
 El servicio queda disponible en `http://localhost:8083`.
 
+## Docker
+
+El `Dockerfile` usa dos etapas:
+
+1. **Compilación** (`maven:3.9.9-eclipse-temurin-21`): descarga las dependencias (en una capa separada para aprovechar la caché) y genera el `.jar`.
+2. **Ejecución** (`eclipse-temurin:21-jre-alpine`): imagen liviana solo con el JRE, usuario sin privilegios (uid 1001), `HEALTHCHECK` y la JVM limitada al 75% de la memoria del contenedor.
+
+```bash
+docker build -t ms-ventas:1.0.0 .
+docker run -p 8083:8083 -e DB_HOST=host.docker.internal -e DB_PASSWORD=root --name ms-ventas ms-ventas:1.0.0
+```
+
+`DB_HOST=host.docker.internal` permite al contenedor usar el MySQL instalado en tu computador. Para levantar el sistema completo (todos los servicios + MySQL) usa el `docker-compose.yml` del repositorio [infraestructura-swarm](https://github.com/maca2003/infraestructura-swarm).
+
+## CI/CD (GitHub Actions)
+
+Archivo `.github/workflows/ci-cd.yml`. Se ejecuta en cada push o pull request a `main` y `develop`:
+
+| Etapa | Ramas | Qué hace |
+|---|---|---|
+| Build y test | todas | `mvn clean verify` (compila, ejecuta pruebas y genera el `.jar`) |
+| Provisionar Amazon ECR | `main` | Crea el repositorio de imágenes `ms-ventas` en ECR si no existe |
+| Construir y publicar imagen | `main` | `docker build` y `docker push` a ECR con etiquetas `<commit>` y `latest` |
+| Desplegar en Docker Swarm | `main` | Por SSH al manager: `docker service update --image ... sistema_ms-ventas` y verifica que `/api/ventas` responda 200 a través del API Gateway |
+
+Secrets requeridos (Settings → Secrets and variables → Actions):
+
+| Secret | Valor |
+|---|---|
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | Learner Lab → AWS Details → AWS CLI (cambian en cada sesión) |
+| `EC2_SSH_KEY` | Contenido de `labsuser.pem` |
+| `EC2_HOST` | IP pública del manager (salida `IpPublicaManager` del stack `cluster-swarm`) |
+
 ## Endpoints
 
 | Método | Ruta | Descripción |
