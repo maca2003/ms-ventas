@@ -1,0 +1,129 @@
+name: CI/CD ms-ventas
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  SERVICIO: ms-ventas
+
+jobs:
+  # 1. Compila, ejecuta las pruebas unitarias y empaqueta el .jar
+  build-test:
+    name: Build y test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: mvn clean verify
+        run: mvn -B clean verify
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ms-ventas-jar
+          path: target/ms-ventas-1.0.0.jar
+
+  # 2. Provisiona el repositorio de imágenes en Amazon ECR (si no existe)
+  provisionar:
+    name: Provisionar Amazon ECR
+    needs: build-test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Credenciales AWS (Learner Lab)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Crear repositorio ECR
+        run: |
+          aws ecr describe-repositories --repository-names "$SERVICIO" >/dev/null 2>&1 || \
+            aws ecr create-repository --repository-name "$SERVICIO" \
+              --image-scanning-configuration scanOnPush=true
+
+  # 3. Construye la imagen Docker y la publica en ECR
+  imagen:
+    name: Construir y publicar imagen Docker
+    needs: provisionar
+    runs-on: ubuntu-latest
+    outputs:
+      imagen: ${{ steps.publicar.outputs.imagen }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Credenciales AWS (Learner Lab)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login en Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: docker build y push
+        id: publicar
+        run: |
+          IMAGEN="${{ steps.ecr.outputs.registry }}/${SERVICIO}"
+          docker build -t "${IMAGEN}:${GITHUB_SHA}" -t "${IMAGEN}:latest" .
+          docker push "${IMAGEN}:${GITHUB_SHA}"
+          docker push "${IMAGEN}:latest"
+          echo "imagen=${IMAGEN}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+  # 4. Actualiza el servicio en el clúster Docker Swarm (EC2)
+  desplegar:
+    name: Desplegar en Docker Swarm
+    needs: imagen
+    runs-on: ubuntu-latest
+    env:
+      SSH_OPTS: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i llave.pem
+    steps:
+      - name: Preparar llave SSH
+        run: |
+          echo "${{ secrets.EC2_SSH_KEY }}" > llave.pem
+          chmod 600 llave.pem
+
+      - name: docker service update
+        run: |
+          IMAGEN="${{ needs.imagen.outputs.imagen }}"
+          REGISTRY="${IMAGEN%%/*}"
+          ssh $SSH_OPTS "ec2-user@${{ secrets.EC2_HOST }}" bash -s <<EOF
+          set -e
+          aws ecr get-login-password --region $AWS_REGION | sudo docker login --username AWS --password-stdin $REGISTRY
+          if sudo docker service inspect sistema_$SERVICIO >/dev/null 2>&1; then
+            sudo docker service update --with-registry-auth --image $IMAGEN sistema_$SERVICIO
+          else
+            echo "El stack 'sistema' aún no existe: ejecuta primero el pipeline de infraestructura-swarm"
+            exit 1
+          fi
+          EOF
+
+      - name: Verificar que el servicio responde en la nube
+        run: |
+          URL="http://${{ secrets.EC2_HOST }}:8080"
+          for i in $(seq 1 20); do
+            TOKEN=$(curl -s -X POST "$URL/api/auth/login" -H "Content-Type: application/json" \
+              -d '{"username":"admin","password":"admin123"}' | jq -r '.token // empty' 2>/dev/null || true)
+            if [ -n "$TOKEN" ]; then
+              CODIGO=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$URL/api/ventas")
+              echo "GET /api/ventas -> HTTP $CODIGO"
+              [ "$CODIGO" = "200" ] && exit 0
+            fi
+            echo "Reintentando ($i)..."; sleep 15
+          done
+          exit 1
